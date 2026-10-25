@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 虚拟环境
+venv/
+.venv/
+env/
+
+# 运行时数据（含密码哈希与 token，绝不提交）
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/backups/
+*.sqlite3
+
+# 本地配置
+.env
+.env.local
+*.local
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# 日志
+*.log
+logs/
