@@ -179,6 +179,10 @@ FX_DB=/opt/fxsim/data/fxsim.db
 FX_TICK_SECONDS=1
 FX_CANDLE_TICKS=5
 
+# 价格锚定（防止随机游走长期漂到 0 或无穷大）
+FX_PRICE_HALFLIFE=1800
+FX_PRICE_BAND=0.35
+
 # 玩家初始条件
 FX_START_BALANCE=300000
 FX_GOAL=20000000
@@ -214,6 +218,8 @@ sudo chmod 600 /etc/fxsim.env
 | `FX_DB` | `<项目>/data/fxsim.db` | SQLite 路径，必须有写权限 |
 | `FX_TICK_SECONDS` | 1 | 每 tick 的真实秒数。调到 0.2 会非常刺激 |
 | `FX_CANDLE_TICKS` | 5 | 每根 K 线几个 tick |
+| `FX_PRICE_HALFLIFE` | 1800 | 价格回归均衡价的半衰期（tick），越小越稳 |
+| `FX_PRICE_BAND` | 0.35 | 相对均衡价的最大偏离（0.35 = ±35%） |
 | `FX_START_BALANCE` | 300000 | 起始资金 |
 | `FX_GOAL` | 20000000 | 顶部进度条的目标 |
 | `FX_LEVERAGES` | 10,50,100,200,500 | 玩家可选杠杆 |
@@ -743,6 +749,8 @@ curl -s https://fx.example.com/api/health
 | 新闻历史 | 最多回退 30 tick |
 
 所以**不要在别人重仓时重启**——价格跳回 30 秒前，持仓的浮盈浮亏会突变，可能误触发强平。选在线人数少的时候操作。
+
+> 从旧版本升级时，如果数据库里保存的价格已经漂出 `FX_PRICE_BAND`（例如 USD/JPY 低于 1），启动会自动把价格收回到边界内并打一条 `out of range, clamped to ...` 的 warning。之后价格会按 `FX_PRICE_HALFLIFE` 慢慢向均衡价恢复，这是预期行为。
 
 ### 数据库结构变更
 

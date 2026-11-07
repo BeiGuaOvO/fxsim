@@ -163,6 +163,49 @@ PAIR_CFG = {
     "CHFJPY": {"mid": 172.400, "vol": 0.0055},
 }
 
+# ---------------- 价格锚定 ----------------
+# 没有锚定的对数随机游走跑久了必然漂到 0 或无穷大，这里让价格围绕 mid
+# 做均值回复（Ornstein-Uhlenbeck），并用一条软硬结合的边界兜底。
+PRICE_HALFLIFE = max(120.0, _env_float("FX_PRICE_HALFLIFE", 1800.0))  # 回归半衰期（tick）
+REVERSION = math.log(2.0) / PRICE_HALFLIFE
+MAX_DEVIATION = min(0.90, max(0.05, _env_float("FX_PRICE_BAND", 0.35)))  # 相对 mid 的边界
+PAIR_ANCHOR = {p: cfg["mid"] for p, cfg in PAIR_CFG.items()}
+ANCHOR_LOG = {p: math.log(v) for p, v in PAIR_ANCHOR.items()}
+PRICE_FLOOR_LOG = {p: ANCHOR_LOG[p] - MAX_DEVIATION for p in PAIR_CFG}
+PRICE_CEIL_LOG = {p: ANCHOR_LOG[p] + MAX_DEVIATION for p in PAIR_CFG}
+
+
+def _news_expected_bias() -> dict[str, float]:
+    """新闻库里多空消息并不对称，算出每个货币对每条新闻的期望对数涨跌。"""
+    total = sum(NEWS_WEIGHT[t["size"]] for t in NEWS_LIB) or 1
+    bias = {p: 0.0 for p in PAIR_CFG}
+    for tpl in NEWS_LIB:
+        weight = NEWS_WEIGHT[tpl["size"]]
+        lo, hi = NEWS_SIZE[tpl["size"]]
+        size = (lo + hi) / 2.0
+        if tpl.get("random_pair"):
+            # 乌龙指：随机挑一个货币对向下砸，每个货币对的期望冲击相同
+            for pair in bias:
+                bias[pair] += weight * size * -1.0 / len(bias)
+        else:
+            for pair, k in tpl["pairs"].items():
+                if pair in bias:
+                    bias[pair] += weight * size * k
+    return {p: v / total for p, v in bias.items()}
+
+
+def _news_rate() -> float:
+    """平均每个 tick 触发一条新闻的概率。"""
+    if not NEWS_ON:
+        return 0.0
+    lo = max(10.0, NEWS_MIN)
+    hi = max(NEWS_MIN + 10.0, NEWS_MAX)
+    return 1.0 / ((lo + hi) / 2.0)
+
+
+NEWS_BIAS = _news_expected_bias()
+NEWS_BIAS_PER_TICK = {p: NEWS_BIAS[p] * _news_rate() for p in PAIR_CFG}
+
 
 @dataclass
 class Position:
@@ -208,6 +251,17 @@ class Engine:
 
     # ---------------- 启动 ----------------
 
+    def _clamp_price(self, pair: str, value: float) -> float:
+        """把价格限制在锚定价附近的合理区间内，防止 0、负数或无穷大。"""
+        if not math.isfinite(value) or value <= 0:
+            return PAIR_ANCHOR[pair]
+        x = math.log(value)
+        if x < PRICE_FLOOR_LOG[pair]:
+            return math.exp(PRICE_FLOOR_LOG[pair])
+        if x > PRICE_CEIL_LOG[pair]:
+            return math.exp(PRICE_CEIL_LOG[pair])
+        return value
+
     def load(self) -> None:
         accounts, positions, _ = store.load_state()
         self.accounts = accounts
@@ -230,7 +284,14 @@ class Engine:
             try:
                 for p, v in json.loads(raw).items():
                     if p in self.prices:
-                        self.prices[p] = float(v)
+                        saved = float(v)
+                        fixed = self._clamp_price(p, saved)
+                        if abs(fixed - saved) > 1e-9:
+                            log.warning(
+                                "price %s=%.4f out of range, clamped to %.4f",
+                                p, saved, fixed,
+                            )
+                        self.prices[p] = fixed
             except (ValueError, TypeError):
                 pass
 
@@ -257,7 +318,10 @@ class Engine:
         for _ in range(n - 1):
             walk.append(walk[-1] + random.gauss(0.0, sigma))
         shift = math.log(self.prices[pair]) - walk[-1]
-        self.history[pair] = [math.exp(w + shift) for w in walk]
+        # 历史点也限制在合理区间内，保证图表和实时价格使用同一套边界
+        self.history[pair] = [
+            self._clamp_price(pair, math.exp(w + shift)) for w in walk
+        ]
 
     def ensure_account(self, uid: int) -> None:
         if uid not in self.accounts:
@@ -277,6 +341,8 @@ class Engine:
             "stopout": STOPOUT,
             "warn": WARN,
             "topup_target": TOPUP_TARGET,
+            "price_band": round(MAX_DEVIATION, 3),
+            "price_halflife": round(PRICE_HALFLIFE, 1),
         }
 
     async def run(self) -> None:
@@ -325,7 +391,15 @@ class Engine:
         for pair, cfg in PAIR_CFG.items():
             sigma = cfg["vol"] / math.sqrt(1440.0) * 4.0
             shock = sigma * vmult[pair] * random.gauss(0.0, 1.0)
-            self.prices[pair] *= math.exp(drift[pair] + shock)
+
+            x = math.log(self.prices[pair])
+            # 均值回复：价格偏离锚点越远，回拉越强
+            x -= REVERSION * (x - ANCHOR_LOG[pair])
+            # 抵消新闻库的期望偏置，否则长期会单边走成 0 或无穷大
+            x += drift[pair] - NEWS_BIAS_PER_TICK[pair]
+            x += shock
+            x = min(max(x, PRICE_FLOOR_LOG[pair]), PRICE_CEIL_LOG[pair])
+            self.prices[pair] = math.exp(x)
 
             self.history[pair].append(self.prices[pair])
             if len(self.history[pair]) > 300:
@@ -355,8 +429,10 @@ class Engine:
             direction = 1 if k > 0 else -1
             size = move * abs(k)
 
-            # 消息瞬间跳空
-            self.prices[pair] *= 1.0 + direction * size * NEWS_GAP
+            # 消息瞬间跳空（立刻做区间约束，避免一根针穿出边界）
+            self.prices[pair] = self._clamp_price(
+                pair, self.prices[pair] * (1.0 + direction * size * NEWS_GAP)
+            )
 
             rest = size * (1.0 - NEWS_GAP)
             self.active.append({
