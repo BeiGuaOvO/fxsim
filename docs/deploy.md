@@ -183,6 +183,9 @@ FX_CANDLE_TICKS=5
 FX_PRICE_HALFLIFE=1800
 FX_PRICE_BAND=0.35
 
+# AI 玩家
+FX_MAX_AI=8
+
 # 玩家初始条件
 FX_START_BALANCE=300000
 FX_GOAL=20000000
@@ -220,6 +223,7 @@ sudo chmod 600 /etc/fxsim.env
 | `FX_CANDLE_TICKS` | 5 | 每根 K 线几个 tick |
 | `FX_PRICE_HALFLIFE` | 1800 | 价格回归均衡价的半衰期（tick），越小越稳 |
 | `FX_PRICE_BAND` | 0.35 | 相对均衡价的最大偏离（0.35 = ±35%） |
+| `FX_MAX_AI` | 8 | 最多可添加的 AI 玩家数量，设为 0 关闭 |
 | `FX_START_BALANCE` | 300000 | 起始资金 |
 | `FX_GOAL` | 20000000 | 顶部进度条的目标 |
 | `FX_LEVERAGES` | 10,50,100,200,500 | 玩家可选杠杆 |

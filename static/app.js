@@ -30,7 +30,10 @@
   let profileName = "";
   let tradeLimit = 10;
   const TRADE_PAGE = 10;
-  const REASON = { manual: "手动", stopout: "强平", bust: "爆仓" };
+  const REASON = {
+    manual: "手动", stopout: "强平", bust: "爆仓",
+    ai: "平仓", ai_tp: "止盈", ai_sl: "止损", ai_time: "到期", ai_flip: "反手",
+  };
 
   const state = {
     prices: {}, positions: [], account: null,
@@ -729,6 +732,7 @@
     $("#pName").textContent = p.name;
 
     const bits = [];
+    if (p.is_ai) bits.push(`AI 玩家 · ${p.persona_label || "策略"}`);
     if (p.rank) bits.push(`排名 #${p.rank} / ${p.total_players}`);
     if (p.joined_at) bits.push(`加入于 ${dateText(p.joined_at)}`);
     if (p.me) bits.push("这是你自己");
@@ -905,9 +909,14 @@
       const rows = data.rows.map((r) => `
         <tr class="${r.me ? "is-me" : ""}">
           <td class="num ${r.rank <= 3 ? `rank-${r.rank}` : "dim"}">${r.rank}</td>
-          <td class="player"><span data-user="${esc(r.name)}">${esc(r.name)}</span>${
-            r.me ? '<span class="tag-you">你</span>' : ""
-          }</td>
+          <td class="player">
+            <div class="player-line">
+              <span data-user="${esc(r.name)}"${r.is_ai ? ' class="ai-name"' : ""}>${esc(r.name)}</span>
+              ${r.is_ai ? '<span class="tag-ai">AI</span>' : ""}
+              ${r.me ? '<span class="tag-you">你</span>' : ""}
+            </div>
+            ${r.is_ai && r.note ? `<span class="ai-note">${esc(r.note)}</span>` : ""}
+          </td>
           <td class="num">¥${money(r.equity)}</td>
           <td class="num dim">¥${money(r.best)}</td>
           <td class="num ${r.return_pct >= 0 ? "up" : "down"}">${
@@ -921,11 +930,45 @@
       $("#leaderboardBody").innerHTML =
         rows || `<tr><td colspan="6" class="empty">还没有人上榜</td></tr>`;
 
+      const aiCount = Number(data.ai) || 0;
+      const maxAi = Number(data.max_ai) || 0;
+      const aiText = aiCount ? `AI ${aiCount}${maxAi ? `/${maxAi}` : ""}` : "";
       $("#leaderboardMeta").textContent =
-        `共 ${data.total} 人` + (data.me ? ` · 我的排名 #${data.me}` : "");
+        `共 ${data.total} 人` +
+        (aiText ? ` · ${aiText}` : "") +
+        (data.me ? ` · 我的排名 #${data.me}` : "");
+      const addBtn = $("#addAiBtn");
+      if (addBtn) addBtn.disabled = maxAi <= 0 || aiCount >= maxAi;
+      const clearBtn = $("#clearAiBtn");
+      if (clearBtn) clearBtn.disabled = aiCount === 0;
         if (!$("#profile").hidden && profileName) refreshProfile();
     } catch (e) {
       /* 排行榜失败不打扰玩家，下一轮自动重试 */
+    }
+  }
+
+  async function addAi() {
+    try {
+      const persona = $("#aiPersona")?.value || "";
+      const r = await api("/api/ai", {
+        method: "POST",
+        body: persona ? JSON.stringify({ persona }) : "{}",
+      });
+      toast(`AI 玩家「${r.ai.name}」已加入`);
+      await loadBoard();
+    } catch (e) {
+      toast(e.message);
+    }
+  }
+
+  async function clearAi() {
+    if (!confirm("清空所有 AI 玩家？")) return;
+    try {
+      const r = await api("/api/ai", { method: "DELETE" });
+      toast(`已移除 ${r.removed} 个 AI 玩家`);
+      await loadBoard();
+    } catch (e) {
+      toast(e.message);
     }
   }
 
@@ -1188,6 +1231,10 @@
       loadTrades(false);
     });
     $("#resetBtn").addEventListener("click", resetAccount);
+    const addAiBtn = $("#addAiBtn");
+    if (addAiBtn) addAiBtn.addEventListener("click", addAi);
+    const clearAiBtn = $("#clearAiBtn");
+    if (clearAiBtn) clearAiBtn.addEventListener("click", clearAi);
     $("#logoutBtn").addEventListener("click", () => {
       if (confirm("退出登录？本地会清除登录状态。")) clearSession();
     });

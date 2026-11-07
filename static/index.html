@@ -197,7 +197,19 @@
       <section class="panel">
         <div class="panel-head">
           <h2>排行榜</h2>
-          <span id="leaderboardMeta" class="dim small"></span>
+          <div class="panel-head-actions">
+            <span id="leaderboardMeta" class="dim small"></span>
+            <select id="aiPersona" class="ai-persona-select" aria-label="AI 策略">
+              <option value="">随机策略</option>
+              <option value="trend">趋势猎手</option>
+              <option value="news">新闻赌徒</option>
+              <option value="fade">均值猎手</option>
+              <option value="degen">梭哈狂魔</option>
+              <option value="steady">稳健老王</option>
+            </select>
+            <button id="addAiBtn" class="btn btn-ghost btn-sm" type="button">+ 添加 AI</button>
+            <button id="clearAiBtn" class="btn btn-ghost btn-sm" type="button" disabled>清空 AI</button>
+          </div>
         </div>
         <div class="table-wrap">
           <table>

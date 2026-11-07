@@ -12,13 +12,14 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import store
-from .engine import CANDLE_TICKS, PAIR_CFG, Engine, TradeError
+from .engine import CANDLE_TICKS, MAX_AI, PAIR_CFG, Engine, TradeError
 
 BASE = Path(__file__).resolve().parent.parent
 STATIC = BASE / "static"
 
 engine = Engine()
 last_order_at: dict[int, float] = {}
+last_ai_at: dict[int, float] = {}
 
 
 @asynccontextmanager
@@ -66,6 +67,10 @@ class OrderIn(BaseModel):
 
 class DepositIn(BaseModel):
     amount: float = Field(gt=0)
+
+
+class AIIn(BaseModel):
+    persona: Optional[str] = None
 
 @app.post("/api/register")
 async def register(body: AuthIn):
@@ -147,6 +152,41 @@ async def deposit(body: DepositIn, uid: int = Depends(current_user)):
         except TradeError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
 
+
+@app.post("/api/ai")
+async def add_ai(body: AIIn, uid: int = Depends(current_user)):
+    now = time.time()
+    if now - last_ai_at.get(uid, 0) < 1.0:
+        raise HTTPException(status_code=429, detail="操作太快了")
+    last_ai_at[uid] = now
+    async with engine.lock:
+        try:
+            ai = engine.add_ai(body.persona)
+        except TradeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return {
+            "ok": True,
+            "ai": engine.ai_view(ai.uid),
+            "total": len(engine.ai),
+        }
+
+
+@app.delete("/api/ai")
+async def clear_ai(uid: int = Depends(current_user)):
+    async with engine.lock:
+        removed = engine.clear_ai()
+    return {"ok": True, "removed": removed}
+
+
+@app.delete("/api/ai/{ai_uid}")
+async def remove_ai(ai_uid: int, uid: int = Depends(current_user)):
+    async with engine.lock:
+        try:
+            name = engine.remove_ai(ai_uid)
+        except TradeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+    return {"ok": True, "name": name}
+
 @app.get("/api/history")
 async def history(pair: str = "USDJPY"):
     if pair not in PAIR_CFG:
@@ -173,6 +213,9 @@ async def trades(limit: int = 10, offset: int = 0,
 async def user_profile(username: str, viewer: Optional[int] = Depends(optional_user)):
     uid = await asyncio.to_thread(store.user_id_by_name, username)
     if not uid:
+        async with engine.lock:
+            uid = engine.ai_uid_by_name(username)
+    if not uid:
         raise HTTPException(status_code=404, detail="用户不存在")
     async with engine.lock:
         data = engine.profile_view(uid, viewer)
@@ -185,13 +228,25 @@ async def leaderboard(uid: Optional[int] = Depends(optional_user)):
     async with engine.lock:
         rows = engine.leaderboard(uid)
         total = len(engine.accounts)
+        ai_count = len(engine.ai)
     my_rank = next((r["rank"] for r in rows if r["me"]), None)
-    return {"total": total, "rows": rows[:20], "me": my_rank}
+    return {
+        "total": total,
+        "ai": ai_count,
+        "max_ai": MAX_AI,
+        "rows": rows[:20],
+        "me": my_rank,
+    }
 
 
 @app.get("/api/health")
 async def health():
-    return {"ok": True, "tick": engine.tick, "players": len(engine.accounts)}
+    return {
+        "ok": True,
+        "tick": engine.tick,
+        "players": len(engine.accounts),
+        "ai": len(engine.ai),
+    }
 
 
 @app.websocket("/ws")

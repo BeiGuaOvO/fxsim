@@ -7,7 +7,7 @@ import math
 import os
 import random
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 from collections import deque
 
@@ -46,6 +46,7 @@ LEVERAGES = _env_floats("FX_LEVERAGES", "10,50,100,200,500")
 MIN_AMOUNT = _env_float("FX_MIN_AMOUNT", 1_000.0)
 MAX_AMOUNT = _env_float("FX_MAX_AMOUNT", 10_000_000.0)
 MAX_POSITIONS = 10
+MAX_AI = max(0, min(20, int(_env_float("FX_MAX_AI", 8.0))))
 # 风控三档
 STOPOUT = _env_float("FX_STOPOUT", 50.0)             # 爆仓线：维持率跌破即全部强平
 WARN = _env_float("FX_WARN", 130.0)                  # 预警线：低于此值提示补仓
@@ -206,6 +207,84 @@ def _news_rate() -> float:
 NEWS_BIAS = _news_expected_bias()
 NEWS_BIAS_PER_TICK = {p: NEWS_BIAS[p] * _news_rate() for p in PAIR_CFG}
 
+# ---------------- AI 玩家 ----------------
+# 每个策略的 risk 是单笔最多投入的自由保证金比例，leverage 是可选杠杆列表中的位置（0~1）。
+# take_profit / stop_loss 都是「保证金收益率」，不是价格涨跌幅。
+AI_PERSONAS = {
+    "trend": {
+        "label": "趋势猎手",
+        "risk": 0.16,
+        "leverage": 0.65,
+        "cooldown": (35, 90),
+        "hold": (80, 220),
+        "max_positions": 2,
+        "take_profit": 1.20,
+        "stop_loss": 0.55,
+        "trend_short": 20,
+        "trend_long": 100,
+        "trend_signal": 0.00018,
+    },
+    "news": {
+        "label": "新闻赌徒",
+        "risk": 0.22,
+        "leverage": 0.80,
+        "cooldown": (18, 55),
+        "hold": (20, 80),
+        "max_positions": 3,
+        "take_profit": 0.90,
+        "stop_loss": 0.55,
+    },
+    "fade": {
+        "label": "均值猎手",
+        "risk": 0.16,
+        "leverage": 0.45,
+        "cooldown": (35, 95),
+        "hold": (40, 140),
+        "max_positions": 2,
+        "take_profit": 0.55,
+        "stop_loss": 0.45,
+        "fade_move": 0.0045,
+        "fade_lookback": 24,
+    },
+    "degen": {
+        "label": "梭哈狂魔",
+        "risk": 0.35,
+        "leverage": 1.0,
+        "cooldown": (15, 45),
+        "hold": (15, 90),
+        "max_positions": 1,
+        "take_profit": 2.0,
+        "stop_loss": 0.90,
+    },
+    "steady": {
+        "label": "稳健老王",
+        "risk": 0.10,
+        "leverage": 0.15,
+        "cooldown": (90, 220),
+        "hold": (120, 360),
+        "max_positions": 2,
+        "take_profit": 0.40,
+        "stop_loss": 0.30,
+        "trend_short": 30,
+        "trend_long": 140,
+        "trend_signal": 0.00035,
+    },
+}
+
+AI_EXIT_LABELS = {
+    "ai": "平仓",
+    "ai_tp": "止盈",
+    "ai_sl": "止损",
+    "ai_time": "到期",
+    "ai_flip": "反手",
+    "stopout": "强平",
+    "bust": "爆仓",
+}
+
+
+def _pair_label(pair: str) -> str:
+    return f"{pair[:3]}/{pair[3:]}"
+
 
 @dataclass
 class Position:
@@ -217,6 +296,7 @@ class Position:
     entry: float
     leverage: float
     opened_at: float
+    opened_tick: int = 0
 
     @property
     def notional(self) -> float:
@@ -225,6 +305,19 @@ class Position:
     @property
     def margin(self) -> float:
         return self.notional / self.leverage
+
+
+@dataclass
+class AIPlayer:
+    uid: int
+    name: str
+    persona: str
+    created_at: float
+    cooldown: int = 0
+    last_news_id: int = 0
+    last_action: str = "刚入场，正在观察"
+    trades: list[dict] = field(default_factory=list)
+    curve: list[dict] = field(default_factory=list)
 
 
 class TradeError(Exception):
@@ -241,6 +334,10 @@ class Engine:
         self.alerts: dict[int, list[str]] = {}
         self.warned: set[int] = set()
         self.lock = asyncio.Lock()
+        self.ai: dict[int, AIPlayer] = {}
+        self.ai_next_uid = -1
+        self.ai_position_seq = 0
+        self.ai_trade_seq = 0
 
         self.tick = 0
         self.headline = "市场开盘，等待第一个消息。"
@@ -275,6 +372,7 @@ class Engine:
                 entry=r["entry_price"],
                 leverage=float(r.get("leverage") or 100.0),
                 opened_at=r["opened_at"],
+                opened_tick=0,
             )
             for r in positions
         }
@@ -311,6 +409,7 @@ class Engine:
         self.next_news = self.tick + 60
         for p in PAIR_CFG:
             self.seed_history(p)
+        self.load_ai()
 
     def seed_history(self, pair: str, n: int = 240) -> None:
         sigma = PAIR_CFG[pair]["vol"] / math.sqrt(1440.0) * 4.0
@@ -343,6 +442,7 @@ class Engine:
             "topup_target": TOPUP_TARGET,
             "price_band": round(MAX_DEVIATION, 3),
             "price_halflife": round(PRICE_HALFLIFE, 1),
+            "max_ai": MAX_AI,
         }
 
     async def run(self) -> None:
@@ -361,6 +461,7 @@ class Engine:
         self.tick += 1
         self.move_prices()
         self.maybe_news()
+        self.run_ai()
         self.check_risk()
         if self.tick % 30 == 0:
             self.snapshot()
@@ -464,6 +565,343 @@ class Engine:
     def news_view(self) -> list[dict]:
         return list(reversed(self.news))[:8]
 
+    # ---------------- AI 玩家 ----------------
+
+    def is_ai(self, uid: int) -> bool:
+        return uid in self.ai
+
+    def _new_ai_uid(self) -> int:
+        while self.ai_next_uid in self.accounts or self.ai_next_uid in self.ai:
+            self.ai_next_uid -= 1
+        uid = self.ai_next_uid
+        self.ai_next_uid -= 1
+        return uid
+
+    def _unique_ai_name(self, name: str) -> str:
+        base = (name or "").strip()[:24] or "AI·无名"
+        names = {a.name for a in self.ai.values()}
+        if base not in names:
+            return base
+        i = 2
+        while True:
+            suffix = f" {i}"
+            candidate = (
+                base[:24 - len(suffix)] + suffix
+                if len(base) + len(suffix) > 24
+                else base + suffix
+            )
+            if candidate not in names:
+                return candidate
+            i += 1
+
+    def load_ai(self) -> None:
+        """只恢复 AI 名单和策略；余额与持仓是每个服务进程重新开始的。"""
+        if MAX_AI <= 0:
+            return
+        self.ai.clear()
+        self.ai_next_uid = -1
+        raw = store.load_meta("ai_players")
+        if not raw:
+            return
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            return
+        if not isinstance(data, list):
+            return
+        for item in data:
+            if len(self.ai) >= MAX_AI:
+                break
+            if not isinstance(item, dict):
+                continue
+            persona = item.get("persona")
+            if not isinstance(persona, str) or persona not in AI_PERSONAS:
+                continue
+            base = AI_PERSONAS[persona]["label"]
+            name = self._unique_ai_name(str(item.get("name") or f"AI·{base}"))
+            try:
+                created_at = float(item.get("created_at") or time.time())
+            except (TypeError, ValueError):
+                created_at = time.time()
+            self._create_ai(name, persona, created_at, random.randint(5, 20))
+
+    def _create_ai(self, name: str, persona: str, created_at: float, cooldown: int) -> AIPlayer:
+        uid = self._new_ai_uid()
+        self.accounts[uid] = {
+            "user_id": uid,
+            "balance": START_BALANCE,
+            "start_balance": START_BALANCE,
+            "best_equity": START_BALANCE,
+            "status": "active",
+            "updated_at": time.time(),
+        }
+        ai = AIPlayer(
+            uid=uid,
+            name=self._unique_ai_name(name),
+            persona=persona,
+            created_at=created_at,
+            cooldown=max(0, int(cooldown)),
+            last_news_id=self.news_seq,
+        )
+        self.ai[uid] = ai
+        return ai
+
+    def add_ai(self, persona: Optional[str] = None) -> AIPlayer:
+        if MAX_AI <= 0:
+            raise TradeError("AI 玩家功能已关闭")
+        if len(self.ai) >= MAX_AI:
+            raise TradeError(f"最多只能添加 {MAX_AI} 个 AI 玩家")
+        if persona is None:
+            persona = random.choice(list(AI_PERSONAS))
+        elif persona not in AI_PERSONAS:
+            raise TradeError("未知的 AI 策略")
+
+        label = AI_PERSONAS[persona]["label"]
+        name = self._unique_ai_name(f"AI·{label}")
+        ai = self._create_ai(name, persona, time.time(), random.randint(5, 20))
+        self._persist_ai()
+        log.info("ai added: %s (%s)", ai.name, persona)
+        return ai
+
+    def remove_ai(self, ai_uid: int) -> str:
+        ai = self.ai.get(ai_uid)
+        if not ai:
+            raise TradeError("AI 玩家不存在")
+        for pid in [p.id for p in self.positions.values() if p.user_id == ai_uid]:
+            del self.positions[pid]
+        self.accounts.pop(ai_uid, None)
+        self.ai.pop(ai_uid, None)
+        self.warned.discard(ai_uid)
+        self._persist_ai()
+        return ai.name
+
+    def clear_ai(self) -> int:
+        count = len(self.ai)
+        for uid in list(self.ai):
+            for pid in [p.id for p in self.positions.values() if p.user_id == uid]:
+                del self.positions[pid]
+            self.accounts.pop(uid, None)
+            self.warned.discard(uid)
+        self.ai.clear()
+        self._persist_ai()
+        return count
+
+    def _persist_ai(self) -> None:
+        rows = [
+            {"name": a.name, "persona": a.persona, "created_at": a.created_at}
+            for a in self.ai.values()
+        ]
+        store.save_meta("ai_players", json.dumps(rows, ensure_ascii=False))
+
+    def ai_uid_by_name(self, name: str) -> Optional[int]:
+        for uid, ai in self.ai.items():
+            if ai.name == name:
+                return uid
+        return None
+
+    def ai_view(self, uid: int) -> dict:
+        ai = self.ai.get(uid)
+        acc = self.accounts.get(uid)
+        if not ai or not acc:
+            return {}
+        equity, used = self.account_equity(uid)
+        return {
+            "uid": uid,
+            "name": ai.name,
+            "persona": ai.persona,
+            "persona_label": AI_PERSONAS[ai.persona]["label"],
+            "balance": round(acc["balance"]),
+            "equity": round(equity),
+            "margin": round(used),
+            "status": acc["status"],
+            "last_action": ai.last_action,
+        }
+
+    def run_ai(self) -> None:
+        for uid, ai in list(self.ai.items()):
+            acc = self.accounts.get(uid)
+            if not acc or acc["status"] != "active":
+                continue
+            if ai.cooldown > 0:
+                ai.cooldown -= 1
+            try:
+                self._ai_manage(uid, ai)
+                if ai.cooldown <= 0:
+                    self._ai_decide(uid, ai)
+            except Exception:
+                log.exception("ai %s failed", ai.name)
+
+    def _ai_manage(self, uid: int, ai: AIPlayer) -> None:
+        cfg = AI_PERSONAS[ai.persona]
+        for pos in [p for p in self.positions.values() if p.user_id == uid]:
+            price = self.px(pos.pair)
+            margin_return = (price - pos.entry) / pos.entry * pos.leverage * pos.side
+            age = max(0, self.tick - pos.opened_tick) if pos.opened_tick else 0
+            reason = None
+
+            if margin_return <= -cfg["stop_loss"]:
+                reason = "ai_sl"
+            elif margin_return >= cfg["take_profit"]:
+                reason = "ai_tp"
+            elif age >= cfg["hold"][1]:
+                reason = "ai_time"
+            elif ai.persona == "trend" and age > 20:
+                signal = self._ai_trend_signal(
+                    pos.pair, cfg["trend_short"], cfg["trend_long"]
+                )
+                if signal * pos.side < -cfg["trend_signal"]:
+                    reason = "ai_flip"
+
+            if reason:
+                self.close_position(pos.id, uid=uid, reason=reason)
+
+    def _ai_decide(self, uid: int, ai: AIPlayer) -> None:
+        cfg = AI_PERSONAS[ai.persona]
+        equity, used = self.account_equity(uid)
+        free = equity - used
+        own = [p for p in self.positions.values() if p.user_id == uid]
+
+        if free < MIN_AMOUNT or len(own) >= cfg["max_positions"]:
+            ai.cooldown = random.randint(5, 20)
+            return
+
+        pick = self._ai_pick(ai, cfg, own)
+        if not pick:
+            ai.cooldown = random.randint(8, 22)
+            return
+
+        pair, side, _ = pick
+        if any(p.pair == pair for p in own):
+            ai.cooldown = random.randint(5, 15)
+            return
+
+        amount = math.floor(min(free * cfg["risk"], free * 0.9) / 1000.0) * 1000.0
+        if amount < MIN_AMOUNT:
+            ai.cooldown = random.randint(8, 22)
+            return
+        amount = min(amount, MAX_AMOUNT)
+        leverage = self._ai_leverage(cfg["leverage"])
+
+        try:
+            self.open_position(uid, pair, side, amount, leverage)
+        except TradeError:
+            ai.cooldown = random.randint(8, 22)
+            return
+
+        ai.cooldown = random.randint(*cfg["cooldown"])
+        side_text = "做多" if side > 0 else "做空"
+        ai.last_action = (
+            f"{side_text} {_pair_label(pair)} ¥{amount:,.0f} · {leverage:g}×"
+        )
+
+    def _ai_pick(self, ai: AIPlayer, cfg: dict, own: list[Position]):
+        available = [
+            p for p in PAIR_CFG
+            if not any(pos.pair == p for pos in own)
+        ]
+        if not available:
+            return None
+
+        latest = self.news[-1] if self.news else None
+        if latest and int(latest.get("id") or 0) > ai.last_news_id:
+            ai.last_news_id = int(latest["id"])
+            if ai.persona in ("news", "degen"):
+                for impact in latest.get("impact") or []:
+                    pair = impact.get("pair")
+                    direction = int(impact.get("dir") or 0)
+                    if pair in available and direction in (1, -1):
+                        return pair, direction, "news"
+
+        if ai.persona == "news":
+            return None
+
+        if ai.persona == "degen":
+            if random.random() < 0.55:
+                return None
+            return random.choice(available), random.choice((1, -1)), "random"
+
+        if ai.persona == "fade":
+            look = int(cfg["fade_lookback"])
+            moves = []
+            for pair in available:
+                hist = self.history[pair]
+                if len(hist) <= look:
+                    continue
+                move = self.prices[pair] / hist[-1 - look] - 1.0
+                moves.append((abs(move), pair, move))
+            if not moves:
+                return None
+            size, pair, move = max(moves)
+            if size < cfg["fade_move"]:
+                return None
+            return pair, (-1 if move > 0 else 1), "fade"
+
+        signals = []
+        for pair in available:
+            signal = self._ai_trend_signal(
+                pair, cfg["trend_short"], cfg["trend_long"]
+            )
+            signals.append((abs(signal), pair, signal))
+        if not signals:
+            return None
+        size, pair, signal = max(signals)
+        if size < cfg["trend_signal"]:
+            return None
+        return pair, (1 if signal > 0 else -1), "trend"
+
+    def _ai_trend_signal(self, pair: str, short: int, long: int) -> float:
+        hist = self.history.get(pair) or []
+        if len(hist) < long or long <= 0:
+            return 0.0
+        short_avg = sum(hist[-short:]) / short
+        long_avg = sum(hist[-long:]) / long
+        return short_avg / long_avg - 1.0 if long_avg else 0.0
+
+    def _ai_leverage(self, position: float) -> float:
+        levels = list(LEVERAGES)
+        if not levels:
+            return 1.0
+        index = int(round(position * (len(levels) - 1)))
+        return levels[max(0, min(len(levels) - 1, index))]
+
+    def _ai_stats(self, trades: list[dict]) -> dict:
+        total = len(trades)
+        wins = sum(1 for t in trades if t["pnl"] > 0)
+        losses = sum(1 for t in trades if t["pnl"] < 0)
+        flats = total - wins - losses
+        net = sum(t["pnl"] for t in trades)
+        gross_win = sum(t["pnl"] for t in trades if t["pnl"] > 0)
+        gross_loss = sum(-t["pnl"] for t in trades if t["pnl"] < 0)
+        decided = wins + losses
+        best_streak = worst_streak = cur_win = cur_loss = 0
+        for t in trades:
+            pnl = t["pnl"]
+            if pnl > 0:
+                cur_win += 1
+                cur_loss = 0
+            elif pnl < 0:
+                cur_loss += 1
+                cur_win = 0
+            else:
+                cur_win = cur_loss = 0
+            best_streak = max(best_streak, cur_win)
+            worst_streak = max(worst_streak, cur_loss)
+        return {
+            "total": total,
+            "wins": wins,
+            "losses": losses,
+            "flats": flats,
+            "win_rate": round(wins / decided * 100.0, 1) if decided else 0.0,
+            "net": round(net),
+            "gross_win": round(gross_win),
+            "gross_loss": round(gross_loss),
+            "profit_factor": round(gross_win / gross_loss, 2) if gross_loss > 0 else None,
+            "best": round(max((t["pnl"] for t in trades), default=0.0)),
+            "worst": round(min((t["pnl"] for t in trades), default=0.0)),
+            "best_streak": best_streak,
+            "worst_streak": worst_streak,
+        }
+
     # ---------------- 交易 ----------------
 
     def open_position(self, uid: int, pair: str, side: int,
@@ -502,10 +940,21 @@ class Engine:
         notional = amount * leverage
         lots = notional / (price * CONTRACT)
 
-        pid = store.insert_position(uid, pair, side, lots, price, None, None, leverage)
-        pos = Position(pid, uid, pair, side, lots, price, leverage, time.time())
+        pid = (
+            self._next_ai_position_id()
+            if self.is_ai(uid)
+            else store.insert_position(uid, pair, side, lots, price, None, None, leverage)
+        )
+        pos = Position(
+            pid, uid, pair, side, lots, price, leverage, time.time(),
+            opened_tick=self.tick,
+        )
         self.positions[pid] = pos
         return pos
+
+    def _next_ai_position_id(self) -> int:
+        self.ai_position_seq -= 1
+        return self.ai_position_seq
 
     def close_position(self, pid: int, uid: Optional[int] = None, reason: str = "manual") -> float:
         pos = self.positions.get(pid)
@@ -519,6 +968,35 @@ class Engine:
 
         acc = self.accounts[pos.user_id]
         acc["balance"] += pnl
+
+        if self.is_ai(pos.user_id):
+            ai = self.ai.get(pos.user_id)
+            if ai:
+                self.ai_trade_seq += 1
+                ai.trades.append({
+                    "id": self.ai_trade_seq,
+                    "pair": pos.pair,
+                    "side": pos.side,
+                    "lots": round(pos.lots, 4),
+                    "leverage": round(pos.leverage, 2),
+                    "amount": round(pos.margin),
+                    "notional": round(pos.notional),
+                    "entry": pos.entry,
+                    "exit": price,
+                    "pnl": round(pnl),
+                    "reason": reason,
+                    "opened_at": pos.opened_at,
+                    "closed_at": time.time(),
+                })
+                label = AI_EXIT_LABELS.get(reason, "平仓")
+                ai.last_action = (
+                    f"{label} {_pair_label(pos.pair)} {pnl:+,.0f}"
+                )
+                # AI 长时间运行也只保留最近一段成交，避免内存无限增长
+                if len(ai.trades) > 2000:
+                    del ai.trades[:500]
+            del self.positions[pid]
+            return pnl
 
         store.insert_trade(
             pos.user_id, pos.pair, pos.side, pos.lots, pos.entry,
@@ -548,6 +1026,17 @@ class Engine:
             total += self.close_position(pid, reason=reason)
         acc = self.accounts.get(uid)
         if not acc:
+            return
+        if self.is_ai(uid):
+            ai = self.ai.get(uid)
+            if acc["balance"] <= 0:
+                acc["balance"] = 0.0
+                acc["status"] = "blown"
+                if ai:
+                    ai.last_action = "账户爆仓"
+            elif ai:
+                ai.last_action = "强制减仓后继续"
+            self.warned.discard(uid)
             return
         tag = "盈利" if total >= 0 else "亏损"
         if acc["balance"] <= 0:
@@ -579,6 +1068,9 @@ class Engine:
             if used <= 0 and equity <= 0:
                 self.liquidate_all(uid, "bust")
                 continue
+            # AI 不需要补仓提示
+            if self.is_ai(uid):
+                continue
             # 3. 进入预警区 → 提示一次，回到安全区后重新武装
             if used > 0:
                 level = equity / used * 100.0
@@ -598,6 +1090,8 @@ class Engine:
         acc = self.accounts.get(uid)
         if not acc:
             raise TradeError("账户不存在")
+        if self.is_ai(uid):
+            raise TradeError("AI 账户由系统管理")
         if acc["status"] != "active":
             raise TradeError("账户已爆仓，请先重置")
         try:
@@ -624,6 +1118,8 @@ class Engine:
         }
 
     def reset_account(self, uid: int) -> None:
+        if self.is_ai(uid):
+            raise TradeError("AI 账户由系统管理")
         if uid not in self.accounts:
             raise TradeError("账户不存在")
 
@@ -700,6 +1196,14 @@ class Engine:
         ]
     
     def trades_view(self, uid: int, limit: int = 10, offset: int = 0) -> dict:
+        ai = self.ai.get(uid)
+        if ai:
+            rows = list(reversed(ai.trades))[offset:offset + limit]
+            return {
+                "total": len(ai.trades),
+                "rows": rows,
+                "stats": self._ai_stats(ai.trades),
+            }
         rows = []
         for r in store.trade_page(uid, limit, offset):
             lev = float(r.get("leverage") or 100.0)
@@ -729,7 +1233,11 @@ class Engine:
         acc = self.accounts.get(uid)
         if not acc:
             return {}
-        info = store.user_info(uid) or {}
+        ai = self.ai.get(uid)
+        if ai:
+            info = {"username": ai.name, "created_at": ai.created_at}
+        else:
+            info = store.user_info(uid) or {}
         equity, used = self.account_equity(uid)
         base = acc["start_balance"] or START_BALANCE
         ranked = sorted(
@@ -754,10 +1262,13 @@ class Engine:
             "return_pct": round((equity / base - 1.0) * 100.0, 1) if base else 0.0,
             "open_positions": sum(1 for p in self.positions.values() if p.user_id == uid),
             "status": acc["status"],
-            "stats": store.trade_stats(uid),
+            "stats": recent["stats"],
             "trades": recent["rows"],
             "trade_total": recent["total"],
-            "curve": store.equity_series(uid, 120),
+            "curve": list(ai.curve) if ai else store.equity_series(uid, 120),
+            "is_ai": ai is not None,
+            "persona": ai.persona if ai else None,
+            "persona_label": AI_PERSONAS[ai.persona]["label"] if ai else None,
             "me": uid == viewer,
         }
     
@@ -767,13 +1278,18 @@ class Engine:
         for uid, acc in self.accounts.items():
             equity, _ = self.account_equity(uid)
             base = acc["start_balance"] or START_BALANCE
+            ai = self.ai.get(uid)
             rows.append({
-                "name": names.get(uid, f"user{uid}"),
+                "name": ai.name if ai else names.get(uid, f"user{uid}"),
                 "equity": round(equity),
                 "best": round(acc["best_equity"]),
                 "return_pct": round((equity / base - 1.0) * 100.0, 1) if base else 0.0,
                 "status": acc["status"],
                 "me": uid == viewer,
+                "is_ai": ai is not None,
+                "persona": ai.persona if ai else None,
+                "persona_label": AI_PERSONAS[ai.persona]["label"] if ai else None,
+                "note": ai.last_action if ai else "",
             })
         rows.sort(key=lambda r: (r["equity"], r["best"]), reverse=True)
         for i, r in enumerate(rows, 1):
@@ -788,6 +1304,13 @@ class Engine:
             equity, _ = self.account_equity(uid)
             if equity > acc["best_equity"]:
                 acc["best_equity"] = equity
+            if self.is_ai(uid):
+                ai = self.ai.get(uid)
+                if ai:
+                    ai.curve.append({"ts": now, "equity": round(equity)})
+                    if len(ai.curve) > 120:
+                        del ai.curve[:-120]
+                continue
             store.snapshot_equity(uid, now, equity)
             store.save_account(uid, acc["balance"], acc["best_equity"], acc["status"])
 
@@ -800,6 +1323,8 @@ class Engine:
 
         if self.tick % 300 == 0:
             for uid in list(self.accounts):
+                if self.is_ai(uid):
+                    continue
                 store.prune_equity(uid, 1500)
 
     # ---------------- WebSocket ----------------
