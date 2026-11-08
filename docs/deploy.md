@@ -192,6 +192,11 @@ FX_REAL_POLL_SECONDS=10
 FX_REAL_STALE_SECONDS=120
 FX_REAL_HISTORY=1
 
+# 30 天历史回放
+FX_REPLAY_START_BALANCE=1000000
+FX_REPLAY_DEFAULT_SPEED=5
+FX_REPLAY_SPEEDS=1,3,5,10,30,60
+
 # 玩家初始条件
 FX_START_BALANCE=300000
 FX_GOAL=20000000
@@ -234,6 +239,9 @@ sudo chmod 600 /etc/fxsim.env
 | `FX_REAL_POLL_SECONDS` | 10 | 真实盘行情轮询间隔（秒） |
 | `FX_REAL_STALE_SECONDS` | 120 | 超过多久没有新报价就标记为休市/延迟 |
 | `FX_REAL_HISTORY` | 1 | 是否用 Yahoo 1 分钟历史初始化真实盘图表 |
+| `FX_REPLAY_START_BALANCE` | 1000000 | 回放独立账户初始资金 |
+| `FX_REPLAY_DEFAULT_SPEED` | 5 | 回放默认速度（根/秒） |
+| `FX_REPLAY_SPEEDS` | 1,3,5,10,30,60 | 页面可选回放速度 |
 | `FX_START_BALANCE` | 300000 | 起始资金 |
 | `FX_GOAL` | 20000000 | 顶部进度条的目标 |
 | `FX_LEVERAGES` | 10,50,100,200,500 | 玩家可选杠杆 |
@@ -248,16 +256,20 @@ sudo chmod 600 /etc/fxsim.env
 
 ### 真实行情版块
 
-`/real` 页面使用独立账户和真实公共行情，不需要改 Nginx：`/real`、`/api/real/*` 都走现有
-`location /` 反代即可。服务器需要能出站访问 HTTPS：
+`/real` 页面使用独立账户和真实公共行情，不需要改 Nginx：`/real`、`/api/real/*`、`/replay`、
+`/api/replay/*` 都走现有 `location /` 反代即可。服务器需要能出站访问 HTTPS：
 
-- `forex-data-feed.swissquote.com`：主报价源
-- `api.frankfurter.app`：报价失败时的日线回退
-- `query1.finance.yahoo.com`：真实盘图表历史（可用 `FX_REAL_HISTORY=0` 关闭）
+- `forex-data-feed.swissquote.com`：实时主报价源
+- `api.frankfurter.app`：实时报价失败时的日线回退
+- `query1.finance.yahoo.com`：真实盘图表历史（`FX_REAL_HISTORY`）和 30 天回放数据
+  （5 分钟 K 线，`FX_REPLAY_*`）
 
-周末或行情源异常时，报价时间会变旧，页面显示「休市 / 数据延迟」，并明确提示按最后报价成交。
+周末或行情源异常时，真实盘报价时间会变旧，页面显示「休市 / 数据延迟」，并明确提示按最后报价成交。
 真实盘账户、持仓和成交写入 `real_accounts` / `real_positions` / `real_trades` 表，重启不丢；
 图表历史不落库，重启后重新从 Yahoo/轮询重建。首次升级会自动建这三张表，不需要手动迁移。
+
+30 天回放只需要访问 Yahoo；回放会话和账户只存在进程内存，服务重启后会丢失，但不会影响真实盘或
+模拟盘数据。第一次打开回放页面会拉取约 8500 根/货币对的 5 分钟数据，并缓存 6 小时。
 
 ### 上线前值得调的两项
 
@@ -777,6 +789,8 @@ curl -s https://fx.example.com/api/health
 | 真实盘账户、持仓、成交 | 不丢（独立 `real_*` 表实时落库） |
 | 真实盘图表历史 | 重启后重新从 Yahoo 1 分钟数据和轮询报价重建 |
 | 真实盘行情 | 重启后重新拉取；周末/断网时停在最后收到的报价 |
+| 30 天回放会话 | 丢（内存态，重启后重新开始；不影响真实盘/模拟盘） |
+| 30 天回放数据缓存 | 丢，首次打开回放页面重新从 Yahoo 拉取 |
 
 所以**不要在别人重仓时重启**——价格跳回 30 秒前，持仓的浮盈浮亏会突变，可能误触发强平。选在线人数少的时候操作。
 

@@ -14,15 +14,18 @@ from pydantic import BaseModel, Field
 from . import real_store, store
 from .engine import CANDLE_TICKS, MAX_AI, PAIR_CFG, Engine, TradeError
 from .real import RealEngine
+from .replay import ReplayEngine, ReplayError
 
 BASE = Path(__file__).resolve().parent.parent
 STATIC = BASE / "static"
 
 engine = Engine()
 real_engine = RealEngine()
+replay_engine = ReplayEngine()
 last_order_at: dict[int, float] = {}
 last_ai_at: dict[int, float] = {}
 last_real_order_at: dict[int, float] = {}
+last_replay_order_at: dict[int, float] = {}
 
 
 @asynccontextmanager
@@ -79,6 +82,16 @@ class DepositIn(BaseModel):
 
 class AIIn(BaseModel):
     persona: Optional[str] = None
+
+
+class ReplayStartIn(BaseModel):
+    start_ts: Optional[float] = None
+    speed: Optional[float] = None
+
+
+class ReplayControlIn(BaseModel):
+    playing: Optional[bool] = None
+    speed: Optional[float] = None
 
 @app.post("/api/register")
 async def register(body: AuthIn):
@@ -283,6 +296,104 @@ async def real_trades(limit: int = 10, offset: int = 0,
 @app.get("/real")
 async def real_page():
     return FileResponse(STATIC / "real.html")
+
+
+# ---------------- 历史回放 ----------------
+
+@app.get("/api/replay/meta")
+async def replay_meta(uid: int = Depends(current_user)):
+    try:
+        await asyncio.to_thread(replay_engine.load_data)
+    except ReplayError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    async with replay_engine.lock:
+        return replay_engine.meta()
+
+
+@app.post("/api/replay/start")
+async def replay_start(body: ReplayStartIn, uid: int = Depends(current_user)):
+    try:
+        await asyncio.to_thread(replay_engine.load_data)
+        async with replay_engine.lock:
+            session = replay_engine.start(uid, body.start_ts, body.speed)
+            return replay_engine.state_view(session)
+    except ReplayError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+
+@app.get("/api/replay/state")
+async def replay_state(uid: int = Depends(current_user)):
+    async with replay_engine.lock:
+        session = replay_engine.get_session(uid)
+        if not session:
+            return {"active": False}
+        return replay_engine.state_view(session)
+
+
+@app.get("/api/replay/history")
+async def replay_history(pair: str = "USDJPY", limit: int = 300,
+                         uid: int = Depends(current_user)):
+    if pair not in PAIR_CFG:
+        raise HTTPException(status_code=400, detail="未知货币对")
+    limit = max(20, min(limit, 500))
+    async with replay_engine.lock:
+        session = replay_engine.get_session(uid)
+        if not session:
+            raise HTTPException(status_code=400, detail="回放尚未开始")
+        return replay_engine.history_view(session, pair, limit)
+
+
+@app.post("/api/replay/orders")
+async def replay_order(body: OrderIn, uid: int = Depends(current_user)):
+    now = time.time()
+    if now - last_replay_order_at.get(uid, 0) < 0.3:
+        raise HTTPException(status_code=429, detail="操作太快了")
+    last_replay_order_at[uid] = now
+    async with replay_engine.lock:
+        session = replay_engine.get_session(uid)
+        if not session:
+            raise HTTPException(status_code=400, detail="回放尚未开始")
+        replay_engine.advance(session)
+        try:
+            pos = replay_engine.open_position(
+                session, body.pair, body.side, body.amount, body.leverage
+            )
+            return {"ok": True, "position_id": pos.id}
+        except TradeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/replay/positions/{pid}/close")
+async def replay_close(pid: int, uid: int = Depends(current_user)):
+    async with replay_engine.lock:
+        session = replay_engine.get_session(uid)
+        if not session:
+            raise HTTPException(status_code=400, detail="回放尚未开始")
+        replay_engine.advance(session)
+        try:
+            pnl = replay_engine.close_position(session, pid)
+            return {"ok": True, "pnl": round(pnl)}
+        except TradeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/replay/control")
+async def replay_control(body: ReplayControlIn, uid: int = Depends(current_user)):
+    async with replay_engine.lock:
+        session = replay_engine.get_session(uid)
+        if not session:
+            raise HTTPException(status_code=400, detail="回放尚未开始")
+        try:
+            replay_engine.control(session, body.playing, body.speed)
+        except ReplayError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return {"ok": True}
+
+
+@app.get("/replay")
+async def replay_page():
+    return FileResponse(STATIC / "replay.html")
+
 
 @app.get("/api/users/{username}")
 async def user_profile(username: str, viewer: Optional[int] = Depends(optional_user)):

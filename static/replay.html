@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FX 历史回放 · 30 天真实数据</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/real.css">
+  <link rel="stylesheet" href="/static/replay.css">
+</head>
+<body>
+
+  <header class="topbar">
+    <div class="brand">FX <span>历史回放</span></div>
+    <p id="replayTicker" class="ticker">正在加载 30 天真实数据…</p>
+
+    <dl id="replayAcct" class="acct"></dl>
+
+    <div class="topbar-actions">
+      <a class="btn btn-ghost btn-sm" href="/real">← 真实行情</a>
+      <a class="btn btn-ghost btn-sm" href="/">模拟盘</a>
+      <button id="replayLogoutBtn" class="btn btn-ghost btn-sm" type="button">退出</button>
+    </div>
+  </header>
+
+  <main class="layout replay-layout">
+
+    <div id="replayBanner" class="real-banner">
+      <span id="replayDot" class="market-dot"></span>
+      <strong id="replayStatus">正在加载 30 天数据…</strong>
+      <span id="replaySource" class="dim small"></span>
+      <span class="spacer"></span>
+      <span class="real-tag">30 天 · 5 分钟 · 模拟资金</span>
+    </div>
+
+    <section class="panel replay-controls-panel">
+      <div class="replay-controls">
+        <div class="field replay-field">
+          <label for="replayStart">回放开始时间</label>
+          <input id="replayStart" type="datetime-local">
+        </div>
+        <div class="field replay-field replay-speed-field">
+          <label for="replaySpeed">回放速度</label>
+          <select id="replaySpeed"></select>
+        </div>
+        <button id="replayStartBtn" class="btn btn-primary" type="button">开始回放</button>
+        <button id="replayToggleBtn" class="btn btn-ghost" type="button" disabled>暂停</button>
+        <button id="replayRestartBtn" class="btn btn-ghost" type="button" disabled>重新开始</button>
+        <span id="replayMeta" class="dim small"></span>
+      </div>
+
+      <div class="replay-progress-wrap">
+        <div class="replay-progress"><i id="replayProgressFill"></i></div>
+        <div class="replay-times">
+          <span id="replayTimeStart">—</span>
+          <span id="replayTimeCursor">—</span>
+          <span id="replayTimeEnd">—</span>
+        </div>
+      </div>
+    </section>
+
+    <div id="replayRiskBar" class="risk-bar" hidden>
+      <span id="replayRiskText"></span>
+    </div>
+
+    <section class="grid-main">
+      <div class="panel">
+        <div class="panel-head">
+          <h2>回放行情</h2>
+          <span id="replayPairName" class="dim small">USD/JPY</span>
+        </div>
+
+        <div id="replayPairs" class="pairs"></div>
+
+        <div class="chart-wrap real-chart-wrap">
+          <canvas id="replayChart"></canvas>
+        </div>
+
+        <dl id="replayQuote" class="quote"></dl>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>下单</h2>
+          <span id="replayOrderPair" class="dim small">USD/JPY</span>
+        </div>
+
+        <form id="replayOrderForm" class="form" novalidate>
+          <div class="field">
+            <label>杠杆倍数</label>
+            <div id="replayLeverageChips" class="chip-row"></div>
+          </div>
+
+          <div class="field">
+            <label for="replayAmount">投入金额（保证金）</label>
+            <input id="replayAmount" type="number" value="10000"
+                   step="1000" min="1000" inputmode="decimal">
+          </div>
+
+          <div id="replayAmountChips" class="chip-row">
+            <button type="button" data-replay-amount="10000">¥1 万</button>
+            <button type="button" data-replay-amount="30000">¥3 万</button>
+            <button type="button" data-replay-amount="50000">¥5 万</button>
+            <button type="button" data-replay-amount="100000">¥10 万</button>
+            <button type="button" data-replay-amount="300000">¥30 万</button>
+          </div>
+
+          <p id="replayMarginHint" class="hint"></p>
+          <p id="replayLeverageHint" class="hint"></p>
+          <p id="replayAccountNote" class="hint hint-warn" hidden></p>
+
+          <div class="trade-actions">
+            <button id="replayLongBtn" class="btn btn-buy" type="button">做多</button>
+            <button id="replayShortBtn" class="btn btn-sell" type="button">做空</button>
+          </div>
+
+          <p class="hint">
+            历史回放使用 Yahoo Finance 最近 30 天的 5 分钟真实数据，模拟资金，不涉及真实资金。<br>
+            回放账户独立，每次开始或重新开始都会重置为 ¥1,000,000。
+          </p>
+        </form>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>回放持仓</h2>
+        <span class="dim small">按当前回放光标价格计算浮盈亏</span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>货币对</th>
+              <th>方向</th>
+              <th>投入</th>
+              <th>杠杆</th>
+              <th>名义价值</th>
+              <th>开仓价</th>
+              <th>现价</th>
+              <th>浮动盈亏</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="replayPositionsBody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>回放成交</h2>
+        <span id="replayTradeMeta" class="dim small"></span>
+      </div>
+
+      <div id="replayStats" class="stat-grid"></div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>时间</th>
+              <th>货币对</th>
+              <th>方向</th>
+              <th>投入</th>
+              <th>杠杆</th>
+              <th>开仓价</th>
+              <th>平仓价</th>
+              <th>盈亏</th>
+              <th>结算</th>
+            </tr>
+          </thead>
+          <tbody id="replayTradesBody"></tbody>
+        </table>
+      </div>
+    </section>
+
+  </main>
+
+  <div id="replayToasts" class="toasts" aria-live="polite"></div>
+
+  <script src="/static/sound.js" defer></script>
+  <script src="/static/replay.js" defer></script>
+</body>
+</html>
