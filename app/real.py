@@ -325,6 +325,18 @@ class RealEngine:
         for pair, points in history.items():
             if pair not in self.ticks or not points:
                 continue
+            live = self.quotes.get(pair)
+            if live and live.get("source") != "Yahoo 历史":
+                try:
+                    cutoff = float(live.get("ts") or 0)
+                except (TypeError, ValueError):
+                    cutoff = 0.0
+                if cutoff > 0:
+                    # 只用当前实时报价之前的历史，让图表和最新报价对齐
+                    points = [(t, p) for t, p in points if t <= cutoff + 1.0]
+            if not points:
+                continue
+
             existing = list(self.ticks[pair])
             merged: dict[float, float] = {t: p for t, p in points}
             # 实时 tick 覆盖同时间的历史点，然后按时间排序
@@ -333,8 +345,6 @@ class RealEngine:
             self.ticks[pair] = deque(ordered, maxlen=REAL_TICKS)
             if self.prices[pair] is None:
                 self.prices[pair] = points[-1][1]
-            if points[-1][0] > self.last_update:
-                self.last_update = points[-1][0]
             self.source = "Yahoo 历史" if not self.quotes else self.source
             self.quotes.setdefault(pair, {
                 "price": points[-1][1],
