@@ -12,6 +12,7 @@
 - **实时行情**：服务端每秒生成一个 tick（= 1 分钟游戏时间），WebSocket 推送
 - **价格锚定**：每个品种围绕均衡价做均值回复，并有 ±35% 边界，长期运行不会漂到 0 或无穷大
 - **AI 玩家**：一键添加 5 种策略的 AI 对手，自动开平仓、参与排行榜和用户主页
+- **真实行情**：独立真实盘账户（初始 ¥1,000,000），按 Swissquote 真实报价交易，支持休市/延迟提示
 - **K 线图**：Canvas 绘制，周期可配（默认 5 分钟一根）
 - **杠杆自选**：10 / 50 / 100 / 200 / 500 倍，下单前提示「约可承受反向波动 X%」
 - **三档风控**：维持率 130% 预警 → 50% 强制平仓 → 净值归零爆仓
@@ -64,6 +65,10 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
 | `FX_PRICE_HALFLIFE` | `1800` | 价格回归均衡价的半衰期（tick），越小越稳 |
 | `FX_PRICE_BAND` | `0.35` | 相对均衡价的最大偏离（0.35 = ±35%） |
 | `FX_MAX_AI` | `8` | 最多可添加的 AI 玩家数量，设为 0 关闭 |
+| `FX_REAL_START_BALANCE` | `1000000` | 真实盘独立账户初始资金 |
+| `FX_REAL_POLL_SECONDS` | `10` | 真实盘行情轮询间隔（秒） |
+| `FX_REAL_STALE_SECONDS` | `120` | 超过多久没有新报价就标记为休市/延迟 |
+| `FX_REAL_HISTORY` | `1` | 是否用 Yahoo 1 分钟历史初始化图表 |
 | `FX_STOPOUT` | `50` | 爆仓线（维持率 %） |
 | `FX_WARN` | `130` | 预警线（维持率 %） |
 | `FX_TOPUP_TARGET` | `160` | 补仓目标维持率 |
@@ -120,12 +125,29 @@ AI 的账户和交易是进程内存里的，名单会写入 `meta`；服务重�
 AI 不写 `users` / `accounts` / `positions` / `trades` / `equity` 表，不会污染真人数据。
 最多同时存在 `FX_MAX_AI` 个。
 
+## 真实行情版块
+
+主页面右上角的「真实行情」进入 `/real`。这是完全独立的真实盘：
+
+- 账户独立：初始资金 `FX_REAL_START_BALANCE`（默认 ¥1,000,000），和模拟盘互不影响
+- 行情来源：Swissquote 公共实时报价；失败时用 Frankfurter ECB 日线回退
+- 图表历史：可选用 Yahoo Finance 的 1 分钟数据初始化，之后由轮询报价持续追加
+- 轮询间隔：`FX_REAL_POLL_SECONDS`（默认 10 秒）
+- 休市/延迟：报价超过 `FX_REAL_STALE_SECONDS` 没有更新时，页面显示「休市 / 数据延迟」，
+  周末和网络异常时会保持最后的真实报价
+- 风控规则和模拟盘一致：维持率预警、50% 强平、爆仓、独立成交与战绩统计
+- 真实盘数据存在 `real_accounts` / `real_positions` / `real_trades` 表，服务重启不丢
+
+> 真实盘仍然只是模拟资金，不涉及任何真实资金。行情来自公共接口，可能延迟、中断或
+> 与真实成交价有差异，不能用于真实交易决策。
+
 ## 技术栈
 
 - 后端：FastAPI + Uvicorn，单进程，状态在内存
-- 存储：SQLite（WAL），每 30 tick 落一次盘
-- 推送：WebSocket，1 条消息/秒/连接
-- 前端：原生 HTML/CSS/JS，无构建步骤，Canvas 画 K 线
+- 存储：SQLite（WAL），每 30 tick 落一次盘；真实盘账户/持仓/成交实时落库
+- 推送：模拟盘 WebSocket，1 条消息/秒/连接；真实盘页面每 3 秒轮询、每 10 秒拉历史
+- 前端：原生 HTML/CSS/JS，无构建步骤，Canvas 画 K 线/真实盘走势
+- 真实行情：Swissquote 公共接口 + Frankfurter 日线回退 + Yahoo 1 分钟历史
 
 **必须单 worker**：行情引擎在进程内存里，开多 worker 会出现多套价格源和重复撮合。
 
@@ -135,7 +157,7 @@ AI 不写 `users` / `accounts` / `positions` / `trades` / `equity` 表，不会�
 python -m unittest discover
 ```
 
-覆盖价格长期漂移、极端价格回收和 AI 自动交易。
+覆盖价格长期漂移、极端价格回收、AI 自动交易和真实盘数据解析/撮合。
 
 ## 部署到服务器
 
@@ -149,16 +171,21 @@ python -m unittest discover
 ## 项目结构
 
 ```text
-app/store.py     SQLite 访问层：用户、账户、持仓、成交、净值快照
-app/engine.py    行情引擎：价格生成、新闻、撮合、风控
-app/main.py      FastAPI 路由与 WebSocket
-static/app.js    前端逻辑与渲染
-static/sound.js  Web Audio 音效合成
+app/store.py       SQLite 访问层：用户、账户、持仓、成交、净值快照
+app/engine.py      模拟盘行情引擎：价格生成、新闻、撮合、风控、AI 玩家
+app/real.py        真实盘引擎：Swissquote/Frankfurter 报价、Yahoo 历史、独立账户与风控
+app/real_store.py  真实盘 SQLite 表：账户、持仓、成交
+app/main.py        FastAPI 路由、WebSocket、真实盘接口
+static/app.js      模拟盘前端逻辑与渲染
+static/real.js     真实盘前端逻辑与图表
+static/real.html   真实盘页面
+static/sound.js    Web Audio 音效合成
 ```
 
 ## 免责声明
 
-本项目仅用于编程学习和游戏娱乐。所有价格均为程序生成，与真实市场无关。
+本项目仅用于编程学习和游戏娱乐。模拟盘价格由程序生成，与真实市场无关；真实盘引用
+公共行情接口，可能存在延迟或中断，不构成任何投资建议，也不能用于真实交易决策。
 请勿将其用于任何真实交易决策。
 
 ## License

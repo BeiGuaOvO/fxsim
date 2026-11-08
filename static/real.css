@@ -1,0 +1,96 @@
+/* 真实行情版块 */
+.real-layout {
+  padding-top: 16px;
+}
+
+.real-banner {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 10px 14px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  font-size: 13px;
+}
+
+.real-banner.is-stale {
+  border-color: #7c5a12;
+  background: #221d10;
+}
+
+.real-banner.is-error {
+  border-color: #7f1d1d;
+  background: #2b1114;
+}
+
+.real-banner .spacer {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.real-tag {
+  padding: 2px 8px;
+  font-size: 11px;
+  color: var(--text-dim);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+.market-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-mute);
+}
+
+.market-dot.is-live {
+  background: var(--up);
+  box-shadow: 0 0 0 4px rgba(34, 197, 94, .12);
+  animation: market-pulse 2s ease-in-out infinite;
+}
+
+.market-dot.is-stale {
+  background: var(--gold);
+  box-shadow: 0 0 0 4px rgba(251, 191, 36, .12);
+}
+
+.market-dot.is-error {
+  background: var(--down);
+  box-shadow: 0 0 0 4px rgba(244, 63, 94, .12);
+}
+
+@keyframes market-pulse {
+  50% { box-shadow: 0 0 0 7px rgba(34, 197, 94, .03); }
+}
+
+.real-chart-wrap {
+  height: 320px;
+}
+
+#realChart {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.real-layout .risk-bar {
+  margin: 0;
+}
+
+.real-layout .stat-grid {
+  margin-bottom: 10px;
+}
+
+@media (max-width: 960px) {
+  .real-chart-wrap { height: 250px; }
+}
+
+@media (max-width: 620px) {
+  .real-layout { padding: 10px; }
+  .real-banner { padding: 9px 11px; gap: 7px; }
+  .real-chart-wrap { height: 220px; }
+}

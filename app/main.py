@@ -11,30 +11,38 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import store
+from . import real_store, store
 from .engine import CANDLE_TICKS, MAX_AI, PAIR_CFG, Engine, TradeError
+from .real import RealEngine
 
 BASE = Path(__file__).resolve().parent.parent
 STATIC = BASE / "static"
 
 engine = Engine()
+real_engine = RealEngine()
 last_order_at: dict[int, float] = {}
 last_ai_at: dict[int, float] = {}
+last_real_order_at: dict[int, float] = {}
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     store.init_db()
+    real_store.init_db()
     engine.load()
+    real_engine.load()
     task = asyncio.create_task(engine.run())
+    real_task = asyncio.create_task(real_engine.run())
     try:
         yield
     finally:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+        for job in (task, real_task):
+            job.cancel()
+        for job in (task, real_task):
+            try:
+                await job
+            except asyncio.CancelledError:
+                pass
 
 
 app = FastAPI(title="FX 生存战", lifespan=lifespan)
@@ -208,6 +216,73 @@ async def trades(limit: int = 10, offset: int = 0,
     offset = max(0, offset)
     async with engine.lock:
         return engine.trades_view(uid, limit, offset)
+
+
+# ---------------- 真实盘 ----------------
+
+@app.get("/api/real/state")
+async def real_state(uid: int = Depends(current_user)):
+    async with real_engine.lock:
+        real_engine.ensure_account(uid)
+        return real_engine.state_view(uid)
+
+
+@app.get("/api/real/history")
+async def real_history(pair: str = "USDJPY", limit: int = 300):
+    if pair not in PAIR_CFG:
+        raise HTTPException(status_code=400, detail="未知货币对")
+    limit = max(20, min(limit, 1000))
+    async with real_engine.lock:
+        return real_engine.history_view(pair, limit)
+
+
+@app.post("/api/real/orders")
+async def real_order(body: OrderIn, uid: int = Depends(current_user)):
+    now = time.time()
+    if now - last_real_order_at.get(uid, 0) < 0.3:
+        raise HTTPException(status_code=429, detail="操作太快了")
+    last_real_order_at[uid] = now
+    async with real_engine.lock:
+        real_engine.ensure_account(uid)
+        try:
+            pos = real_engine.open_position(
+                uid, body.pair, body.side, body.amount, body.leverage
+            )
+            return {"ok": True, "position_id": pos.id}
+        except TradeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/real/positions/{pid}/close")
+async def real_close(pid: int, uid: int = Depends(current_user)):
+    async with real_engine.lock:
+        try:
+            pnl = real_engine.close_position(pid, uid=uid)
+            return {"ok": True, "pnl": round(pnl)}
+        except TradeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/real/reset")
+async def real_reset(uid: int = Depends(current_user)):
+    async with real_engine.lock:
+        real_engine.reset_account(uid)
+    return {"ok": True}
+
+
+@app.get("/api/real/trades")
+async def real_trades(limit: int = 10, offset: int = 0,
+                      uid: int = Depends(current_user)):
+    limit = max(1, min(limit, 100))
+    offset = max(0, offset)
+    async with real_engine.lock:
+        real_engine.ensure_account(uid)
+        return real_engine.trades_view(uid, limit, offset)
+
+
+@app.get("/real")
+async def real_page():
+    return FileResponse(STATIC / "real.html")
 
 @app.get("/api/users/{username}")
 async def user_profile(username: str, viewer: Optional[int] = Depends(optional_user)):

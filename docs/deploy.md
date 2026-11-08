@@ -186,6 +186,12 @@ FX_PRICE_BAND=0.35
 # AI 玩家
 FX_MAX_AI=8
 
+# 真实行情版块
+FX_REAL_START_BALANCE=1000000
+FX_REAL_POLL_SECONDS=10
+FX_REAL_STALE_SECONDS=120
+FX_REAL_HISTORY=1
+
 # 玩家初始条件
 FX_START_BALANCE=300000
 FX_GOAL=20000000
@@ -224,6 +230,10 @@ sudo chmod 600 /etc/fxsim.env
 | `FX_PRICE_HALFLIFE` | 1800 | 价格回归均衡价的半衰期（tick），越小越稳 |
 | `FX_PRICE_BAND` | 0.35 | 相对均衡价的最大偏离（0.35 = ±35%） |
 | `FX_MAX_AI` | 8 | 最多可添加的 AI 玩家数量，设为 0 关闭 |
+| `FX_REAL_START_BALANCE` | 1000000 | 真实盘独立账户初始资金 |
+| `FX_REAL_POLL_SECONDS` | 10 | 真实盘行情轮询间隔（秒） |
+| `FX_REAL_STALE_SECONDS` | 120 | 超过多久没有新报价就标记为休市/延迟 |
+| `FX_REAL_HISTORY` | 1 | 是否用 Yahoo 1 分钟历史初始化真实盘图表 |
 | `FX_START_BALANCE` | 300000 | 起始资金 |
 | `FX_GOAL` | 20000000 | 顶部进度条的目标 |
 | `FX_LEVERAGES` | 10,50,100,200,500 | 玩家可选杠杆 |
@@ -235,6 +245,19 @@ sudo chmod 600 /etc/fxsim.env
 | `FX_NEWS` | 1 | 设为 0 关闭新闻 |
 | `FX_NEWS_MIN` / `MAX` | 90 / 240 | 新闻间隔 tick |
 | `FX_NEWS_GAP` | 0.35 | 消息瞬间走完的比例 |
+
+### 真实行情版块
+
+`/real` 页面使用独立账户和真实公共行情，不需要改 Nginx：`/real`、`/api/real/*` 都走现有
+`location /` 反代即可。服务器需要能出站访问 HTTPS：
+
+- `forex-data-feed.swissquote.com`：主报价源
+- `api.frankfurter.app`：报价失败时的日线回退
+- `query1.finance.yahoo.com`：真实盘图表历史（可用 `FX_REAL_HISTORY=0` 关闭）
+
+周末或行情源异常时，报价时间会变旧，页面显示「休市 / 数据延迟」，并明确提示按最后报价成交。
+真实盘账户、持仓和成交写入 `real_accounts` / `real_positions` / `real_trades` 表，重启不丢；
+图表历史不落库，重启后重新从 Yahoo/轮询重建。首次升级会自动建这三张表，不需要手动迁移。
 
 ### 上线前值得调的两项
 
@@ -751,6 +774,9 @@ curl -s https://fx.example.com/api/health
 | 价格走势 | **最多回退 30 tick**（每 30 tick 存一次快照） |
 | K 线历史 | 重启后用当前价重新随机生成，形态会变 |
 | 新闻历史 | 最多回退 30 tick |
+| 真实盘账户、持仓、成交 | 不丢（独立 `real_*` 表实时落库） |
+| 真实盘图表历史 | 重启后重新从 Yahoo 1 分钟数据和轮询报价重建 |
+| 真实盘行情 | 重启后重新拉取；周末/断网时停在最后收到的报价 |
 
 所以**不要在别人重仓时重启**——价格跳回 30 秒前，持仓的浮盈浮亏会突变，可能误触发强平。选在线人数少的时候操作。
 
